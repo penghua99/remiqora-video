@@ -29,7 +29,8 @@ CONTEXTS = (8192, 16384, 32768)
 # the models' parameters (the page's «Параметры»): key -> (type, min, max)
 NUMBERS: dict[str, tuple[type, float, float]] = {"KREA_STEPS": (int, 1, 30), "FLUX2_STEPS": (int, 1, 20),
                                                  "FRAME_FACE_MIN": (float, 0.0, 1.0), "FRAME_TRIES": (int, 1, 6)}
-KEYS = (*NAMES, *FOLDERS, *PATHS, *COMMANDS, "LLM_CTX", *NUMBERS)
+FREE_KEYS = ("LLM_EXTERNAL_BASE_URL", "LLM_EXTERNAL_API_KEY", "LLM_EXTERNAL_MODEL", "QWEN_CONTROL", "QWEN_CONTROL_PROFILE")   # the writer's outside server: free text, empty = back to .env
+KEYS = (*NAMES, *FOLDERS, *PATHS, *COMMANDS, "LLM_CTX", *NUMBERS, *FREE_KEYS)
 ENGINE_KEYS = {"H3_MODEL_ROOTS", "LORA_DIRS", "KREA_LORA_DIRS", "LTX23_LORA_DIRS", "LTX25_LORA_DIRS", "WAN_LORA_DIRS", "FLUX2_LORA_DIRS", "H3_REF_DIR", "COMFY_DIR", "COMFY_PYTHON"}   # the worker reads them at start
 DEFAULTS = {k: getattr(config, k) for k in KEYS}   # .env or built-in, before settings.json
 
@@ -45,6 +46,9 @@ def _value(key: str, v: Any) -> Any:
         if not s:
             raise ValueError(i18n.L("Нужен путь", "A path is needed"))
         return Path(s) if key in PATHS else s
+    if key in FREE_KEYS:   # a URL, a key, a model id, the tray's path: no file-name rules here
+        s = str(v or "").strip().strip('"')
+        return Path(s) if key == "QWEN_CONTROL" and s else s
     if key == "LLM_CTX":
         if int(v) not in CONTEXTS:
             raise ValueError(i18n.L("Контекст: ", "Context: ") + ", ".join(map(str, CONTEXTS)))

@@ -271,10 +271,16 @@ def _llm_view() -> dict:
     except llm.LLMError:   # the cloud server not up yet (a deploy, a stopped pod): the page shows no writer models
         found = []
     for m in found:
-        size = m.bytes or (m.path.stat().st_size + (m.mmproj.stat().st_size if m.mmproj else 0))   # a cloud model: its size from the server
+        size = m.bytes
+        if not size:
+            try:
+                size = m.path.stat().st_size + (m.mmproj.stat().st_size if m.mmproj else 0)   # a cloud model: its size from the server
+            except OSError:   # an outside server's id: no file behind it, the page shows no size
+                size = 0
         ms.append({**m.public(), "path": str(m.path), "gb": _gb(size), "default": m.id == default})
     return {"models": ms, "dirs": [str(d) for d in config.LLM_DIRS], "ctx": config.LLM_CTX, "contexts": list(settings.CONTEXTS),
-            "server": str(config.LLAMA_SERVER_BIN), "server_ok": config.ENGINE == "remote" or config.LLAMA_SERVER_BIN.exists(),
+            "server": config.LLM_EXTERNAL_BASE_URL or str(config.LLAMA_SERVER_BIN),
+            "server_ok": config.ENGINE == "remote" or llm.external() or config.LLAMA_SERVER_BIN.exists(),
             "dest": str(config.LLM_DIRS[-1]) if config.LLM_DIRS else None}
 
 

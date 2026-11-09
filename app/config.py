@@ -146,6 +146,21 @@ LLM_MODEL = os.environ.get("LLM_MODEL", "gemma-4-E4B")   # the default: the firs
 LLM_PORT = int(os.environ.get("LLM_PORT", "8191"))
 LLM_CTX = int(os.environ.get("LLM_CTX", "16384"))
 
+# The writer on an outside OpenAI-compatible server (LM Studio, vLLM, another llama.cpp, a cloud API):
+# LLM_EXTERNAL_BASE_URL set -> the writer calls it instead of our own llama-server; nothing starts or stops here,
+# and the engine's weights stay in the memory while the writer thinks (the outside server spends its own).
+# The base may come with /v1 (http://127.0.0.1:8080/v1) or without it (http://127.0.0.1:1234); /v1/models and
+# /v1/chat/completions are appended either way. An API key is sent as «Bearer» when set.
+LLM_EXTERNAL_BASE_URL = os.environ.get("LLM_EXTERNAL_BASE_URL", "").strip().rstrip("/")
+LLM_EXTERNAL_API_KEY = os.environ.get("LLM_EXTERNAL_API_KEY", "")
+LLM_EXTERNAL_MODEL = os.environ.get("LLM_EXTERNAL_MODEL", "")   # the default: /models' first id, else LLM_MODEL inside an id
+
+# Optional: the local model tray's control CLI (D:\qwen\QwenControl.exe) - before the first call a
+# «start --wait» is sent so the profile is loaded (an already-loaded one is reused). QWEN_CONTROL_PROFILE
+# chooses the profile; empty: the tray's current selection.
+QWEN_CONTROL = Path(os.environ["QWEN_CONTROL"]) if os.environ.get("QWEN_CONTROL") else None
+QWEN_CONTROL_PROFILE = os.environ.get("QWEN_CONTROL_PROFILE", "")
+
 OUTPUT_DIR = ROOT / "outputs"
 DATA_DIR = ROOT / "data"
 LLM_LOG = DATA_DIR / "llama-server.log"

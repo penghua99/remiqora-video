@@ -145,7 +145,67 @@ def cloud_models() -> list[LlmModel]:
             for m in ms]
 
 
+# ---------- the outside server ----------
+# An OpenAI-compatible endpoint of the user's choosing (LLM_EXTERNAL_BASE_URL): D:\qwen's tray, LM Studio,
+# vLLM, a cloud API. It takes precedence over ENGINE=remote and the local llama-server; nothing is started or
+# stopped on this machine, so the engine's weights stay in the memory while the writer thinks.
+
+def external() -> bool:
+    return bool(config.LLM_EXTERNAL_BASE_URL)
+
+
+def _ext_url(path: str) -> str:
+    """The base with /v1 and the path: either '/models' (as models() asks) or '/v1/chat/completions' (as _post
+    passes it through) -> one '/v1', e.g. http://host:port/v1/chat/completions."""
+    path = path[3:] if path.startswith("/v1") else path   # callers disagree about the prefix; the result must not
+    base = config.LLM_EXTERNAL_BASE_URL
+    return base + (path if base.endswith("/v1") else "/v1" + path)
+
+
+def _ext_headers() -> dict:
+    h = {"Content-Type": "application/json"}
+    if config.LLM_EXTERNAL_API_KEY:
+        h["Authorization"] = "Bearer " + config.LLM_EXTERNAL_API_KEY
+    return h
+
+
+def external_models() -> list[LlmModel]:
+    """The outside server's /v1/models as writer models (ids like 'x/<model id>'); the call itself decides what it
+    can do (a vision model there needs no mmproj file here)."""
+    try:
+        req = urllib.request.Request(_ext_url("/models"), headers=_ext_headers())
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = json.load(r).get("data") or []
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        raise LLMError(i18n.L(f"Внешний сервер ({config.LLM_EXTERNAL_BASE_URL}) не дал список моделей: {e}",
+                              f"The outside server ({config.LLM_EXTERNAL_BASE_URL}) did not list its models: {e}")) from e
+    return [LlmModel(id=f"x/{m.get('id', '')}", name=m.get("id", ""), path=Path(m.get("id", "")), size_gb=0.0,
+                     mmproj=None, source=config.LLM_EXTERNAL_BASE_URL)
+            for m in data if m.get("id")]
+
+
+def _ext_post(path: str, body: dict, timeout: float = 600) -> dict:
+    req = urllib.request.Request(_ext_url(path), json.dumps(body).encode(), _ext_headers())
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        raise LLMError(f"LLM server {e.code}: {e.read().decode('utf-8', 'replace')[:500]}") from e
+    except urllib.error.URLError as e:
+        raise LLMError(i18n.L(f"Внешний сервер не ответил: {e}", f"The outside server did not answer: {e}")) from e
+
+
+def _model_bytes(m: LlmModel) -> int:
+    """A model's size for the cache key; an outside server's id has no file behind it (its name carries the key)."""
+    try:
+        return m.path.stat().st_size
+    except OSError:
+        return 0
+
+
 def models() -> list[LlmModel]:
+    if external():
+        return external_models()
     if cloud():
         return cloud_models()
     found: list[tuple[int, Path, Path]] = []
@@ -176,6 +236,9 @@ def find(model_id: Optional[str]) -> LlmModel:
     """The model by id; without one, the default (LLM_MODEL in the file name), else the first one with eyes."""
     ms = models()
     if not ms:
+        if external():
+            raise LLMError(i18n.L(f"Внешний сервер ({config.LLM_EXTERNAL_BASE_URL}) не вернул ни одной модели",
+                                  f"The outside server ({config.LLM_EXTERNAL_BASE_URL}) returned no models at all"))
         raise LLMError(i18n.L("Нет ни одной LLM: положите GGUF в ", "No LLM at all: put a GGUF into ")
                        + i18n.L(" или ", " or ").join(map(str, config.LLM_DIRS)) + i18n.L(" (LLM_DIRS в .env)", " (LLM_DIRS in .env)"))
     if model_id:
@@ -187,8 +250,8 @@ def find(model_id: Optional[str]) -> LlmModel:
         if same or cloud():
             return same or next((m for m in ms if config.LLM_MODEL.lower() in m.name.lower()), None) or ms[0]
         raise LLMError(i18n.L(f"Модель не найдена: {model_id}", f"Model not found: {model_id}"))
-    want = config.LLM_MODEL.lower()
-    return next((m for m in ms if want in m.name.lower()), None) or next((m for m in ms if m.mmproj), ms[0])
+    want = (config.LLM_EXTERNAL_MODEL or config.LLM_MODEL).lower()
+    return next((m for m in ms if want and want in m.name.lower()), None) or next((m for m in ms if m.mmproj), ms[0])
 
 
 # ---------- llama-server ----------
@@ -351,14 +414,50 @@ class RemoteLlama:
             pass
 
 
-class Writer:
-    """SERVER: this machine's llama-server or the cloud one, by the mode at each use (like engine.comfy.Engine)."""
+class ExternalLlama:
+    """The outside OpenAI-compatible server: nothing to start or stop on this machine. QWEN_CONTROL (the tray's
+    CLI), set, gets a «start --wait» so the profile is loaded - an already-loaded one is reused, a stopped tray
+    starts (its response's apiBase is the same LLM_EXTERNAL_BASE_URL the calls go to)."""
 
     def __init__(self) -> None:
-        self.local, self.remote = LlamaServer(), RemoteLlama()
+        self.model: Optional[LlmModel] = None
+
+    @property
+    def pid(self) -> Optional[int]:
+        return None   # no process here: the header's meters show none
+
+    async def start(self, m: LlmModel) -> None:
+        if config.QWEN_CONTROL is not None:
+            await asyncio.to_thread(self._wake)
+        self.model = m
+
+    def _wake(self) -> None:
+        args = [str(config.QWEN_CONTROL), "start", "--wait", "--timeout", "180"]
+        if config.QWEN_CONTROL_PROFILE:
+            args.insert(2, config.QWEN_CONTROL_PROFILE)
+        try:
+            r = subprocess.run(args, capture_output=True, encoding="utf-8", timeout=210,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            out = json.loads(r.stdout or "{}")
+        except (OSError, ValueError, subprocess.TimeoutExpired) as e:
+            raise LLMError(i18n.L(f"QwenControl не ответил: {e}", f"QwenControl did not answer: {e}")) from e
+        if r.returncode != 0 or not out.get("ok"):
+            why = out.get("error") or (r.stderr or "").strip() or f"exit {r.returncode}"
+            raise LLMError(i18n.L(f"QwenControl не поднял модель: {why}", f"QwenControl did not start the model: {why}"))
+
+    async def stop(self) -> None:
+        self.model = None   # the outside server keeps its model loaded: unloading stays its owner's call
+
+
+class Writer:
+    """SERVER: the outside endpoint, this machine's llama-server or the cloud one, by the mode at each use
+    (like engine.comfy.Engine)."""
+
+    def __init__(self) -> None:
+        self.outer, self.local, self.remote = ExternalLlama(), LlamaServer(), RemoteLlama()
 
     def current(self):
-        return self.remote if cloud() else self.local
+        return self.outer if external() else self.remote if cloud() else self.local
 
     @property
     def pid(self) -> Optional[int]:
@@ -396,6 +495,8 @@ def _post_cloud(path: str, body: dict, timeout: float = 600) -> dict:
 
 
 def _post(path: str, body: dict, timeout: float = 600) -> dict:
+    if external():
+        return _ext_post(path, body, timeout)
     if cloud():
         return _post_cloud(path, body, timeout)
     req = urllib.request.Request(URL + path, json.dumps(body).encode(), {"Content-Type": "application/json"})
@@ -469,7 +570,8 @@ class _Split:
 
 def _post_stream(path: str, body: dict, on_piece, timeout: float = 600) -> dict:
     """_post with `stream: true`: on_piece(thinking, answer) for each delta; -> the reply in the plain call's shape."""
-    req = urllib.request.Request(URL + path, json.dumps({**body, "stream": True}).encode(),
+    req = urllib.request.Request(_ext_url(path) if external() else URL + path, json.dumps({**body, "stream": True}).encode(),
+                                 {**_ext_headers(), "Accept": "text/event-stream"} if external() else
                                  {"Content-Type": "application/json", "Accept": "text/event-stream"})
     sp, reasoning, finish = _Split(), [], None
     try:
@@ -613,12 +715,12 @@ class Client:
         if LANG.get() != "Russian":   # the fields' names keep their old «_ru», and a model follows the name over the rules
             system += (f"\n\nLanguage: every field named ru, title_ru, outfit_ru or ending in _ru is written in {LANG.get()}, "
                        f"never in Russian - the names are historical.")
-        if images and not self.model.mmproj:
+        if images and not self.model.mmproj and not external():   # an outside server decides what its models see
             raise LLMError(i18n.L(f"Модель {self.model.name} не видит картинок: рядом с ней нет mmproj-файла",
                                   f"The model {self.model.name} does not see pictures: there is no mmproj file next to it"))
         imgs = [(MIME.get(Path(p).suffix.lower(), "image/jpeg"), base64.b64encode(Path(p).read_bytes()).decode()) for p in images]
         key = hashlib.sha1(json.dumps(
-            [self.model.name, self.model.bytes or self.model.path.stat().st_size, system, user, schema,
+            [self.model.name, self.model.bytes or _model_bytes(self.model), system, user, schema,
              [hashlib.sha1(b.encode()).hexdigest() for _, b in imgs], temperature, seed, max_tokens],
             ensure_ascii=False).encode()).hexdigest()
         cache = config.LLM_CACHE / f"{key}.json"
@@ -699,7 +801,8 @@ async def session(model_id: Optional[str] = None):
         finally:
             _depth["n"] -= 1
         return
-    await COMFY.free()
+    if not external():   # the writer thinks on the outside server: the engine's weights may stay in the memory
+        await COMFY.free()
     await SERVER.start(m)
     outer = _depth["n"] == 0
     _depth.update(n=_depth["n"] + 1, model=m.path)
